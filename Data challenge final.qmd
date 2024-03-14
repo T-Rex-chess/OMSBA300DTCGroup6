@@ -1,0 +1,501 @@
+---
+title: "Data Translation Project - Group 6"
+format: docx
+editor: visual
+---
+
+## Research Question 1
+
+How has COVID affected the health of the retail industry, as measured by employment?
+
+### Data Cleaning
+
+To examine the impact of COVID-19 on retail employment, we utilized data from the IPUMS Current Population Survey. The data was filtered to include individuals aged 18-62 who were in the labor force and worked in the retail industry (NAICS codes 4670-5790). Key variables were created, including a PostCOVID indicator for observations from March 2020 onward, age groups, gender, and total employment status.
+
+```{r}
+if (!require("ipumsr")) stop("Reading IPUMS data into R requires the ipumsr package. It can be installed using the following command: install.packages('ipumsr')")
+library(rio)
+library(dplyr)
+library(tidyverse)
+library(vtable)
+library(fixest)
+library(RColorBrewer)
+library(marginaleffects)
+library(lubridate)
+library(sandwich)
+library(lmtest)
+library(patchwork)
+
+ddi <- read_ipums_ddi("cps_00002.xml")
+data <- read_ipums_micro(ddi)
+ind <- read_csv("indnames.csv")
+industry_df <- import('indnames.csv')
+
+df_final<- data %>% inner_join( industry_df, by = c("IND"="ind")) %>%  
+  filter(YEAR >= 2018,!is.na(INCTOT))
+```
+
+```{r}
+# Data Cleaning
+retail_data <- data %>%
+  filter(IND >= 4670 & IND <= 5790, AGE >= 18 & AGE <= 62, LABFORCE == 2) %>%
+  mutate(PostCOVID = ifelse(YEAR >= 2020 & MONTH >= 3, 1, 0),
+    AgeGroup = case_when(AGE >= 18 & AGE <= 40 ~ 0, AGE >= 41 & AGE <= 62 ~ 1),
+    Gender = case_when(SEX == 1 ~ 1, SEX == 2 ~ 0,TRUE ~ NA_real_),
+    TotalEmployed= ifelse(EMPSTAT %in% c(10,12),1,0),
+    YearMonth = as.yearmon(paste(YEAR, sprintf("%02d", MONTH), "01", sep = "-")))
+```
+
+The data was then aggregated to the year-month level, with employment rates calculated as the weighted mean of the total employed using the WTFINL survey weights. This ensures the employment measures are representative of the population.
+
+```{r}
+# Regression model
+regression <- retail_data %>% 
+  filter(!is.na(WTFINL),!is.na(TotalEmployed)) %>% 
+  group_by(YEAR, YearMonth, AgeGroup, Gender, PostCOVID) %>%
+  summarize(wtemployed = weighted.mean(TotalEmployed, WTFINL, na.rm = TRUE))
+```
+
+### Distribution of the weighted employment rate
+
+Examining the distribution of the weighted employment rate reveals a left-skewed pattern, with a concentration of values around 0.91-0.98 and a longer left tail. This suggests that while employment rates are generally high, there are some notably lower values, likely corresponding to the pandemic period. The histogram's bins show a peak frequency around 0.94-0.96, with employment rates becoming progressively less common moving further left. This skewed shape indicates that the pandemic's impact has pulled down the typical employment rate.
+
+```{r}
+# Distribution of weighted employed 
+ggplot(regression, aes(x = wtemployed)) +
+  geom_histogram(binwidth = 0.01, fill = "blue", color = "white") +
+  labs(title = "Distribution of Weighted Mean Employment", x = "Weighted Mean Employed") +
+  theme_minimal()
+
+```
+
+### Overall Employment Trend Plots
+
+To investigate the impact of the COVID-19 pandemic on the health of the retail industry, we created three graphs that provide a comprehensive view of the employment trend. The first two graphs visualize the monthly trends of employment and unemployment ratios, while the third graph examines the effect of the pandemic on the retail workforce by gender.
+
+```{r}
+# Analyzing monthly trends in employment and unemployment, grouped by year-month
+yearly_data <- retail_data %>%
+  group_by(YEAR, YearMonth, PostCOVID) %>%
+  summarize(TotalLaborForce = sum(LABFORCE %in% c(1, 2)),
+            TotalEmployed = sum(EMPSTAT %in% c(10, 12)),
+            TotalUnemployed = sum(EMPSTAT %in% c(20, 21)),
+            .groups = 'drop')
+
+# Monthly Trend of Employment Ratio Graph
+employment_plot <- ggplot(yearly_data, aes(x = YearMonth, y = yearly_data$TotalEmployed / yearly_data$TotalLaborForce, group = 1)) +
+  geom_line(color = "darkorange", size = 1) +
+  geom_point(color = "steelblue2", size = 1) +
+  geom_vline(xintercept = as.numeric(as.yearmon("Mar 2020")), linetype = "dashed", color = "red") +
+  annotate("text", x = as.yearmon("Mar 2020"), y = 0.9, label = "March 2020", color = "darkgreen", angle = 90, vjust = -0.5, hjust = 0) +
+  labs(title = "Monthly Trend of Employment Ratio", x = "Year-Month", y = "Employment Ratio") +
+  theme_classic()
+
+# Monthly Trend of Unemployment Ratio Graph
+unemployment_plot <- ggplot(yearly_data, aes(x = YearMonth, y = yearly_data$TotalUnemployed / yearly_data$TotalLaborForce, group = 1)) +
+  geom_line(color = "darkorange", size = 1) +
+  geom_point(color = "steelblue2", size = 1) +
+  geom_vline(xintercept = as.numeric(as.yearmon("Mar 2020")), linetype = "dashed", color = "red") +
+  annotate("text", x = as.yearmon("Mar 2020"), y = 0.1, label = "March 2020", color = "darkgreen", angle = 90, vjust = -0.5, hjust = 0) +
+  labs(title = "Monthly Trend of Unemployment Ratio", x = "Year-Month", y = "Unemployment Ratio") +
+  theme_classic()
+
+# Combining the 2 graphs
+employment_plot + unemployment_plot + plot_layout(ncol = 2)
+
+# Exploring gender-specific dynamics in the labor market
+gender_specific <- retail_data %>%
+  group_by(YEAR, YearMonth, PostCOVID) %>%
+  summarize(
+    TotalLaborForce = sum(LABFORCE %in% c(1, 2)),
+    TotalEmployed = sum(EMPSTAT %in% c(10, 12)),
+    TotalUnemployed = sum(EMPSTAT %in% c(20, 21)),
+    MaleEmployed = sum(SEX == 1 & EMPSTAT %in% c(10, 12)),
+    FemaleEmployed = sum(SEX == 2 & EMPSTAT %in% c(10, 12)),
+    MaleUnemployed = sum(SEX == 1 & EMPSTAT %in% c(20, 21)),
+    FemaleUnemployed = sum(SEX == 2 & EMPSTAT %in% c(20, 21))) %>%
+  ungroup()
+
+# Make gender variables into long format
+gender_long <- gender_specific %>% 
+  pivot_longer(c(MaleEmployed, FemaleEmployed, MaleUnemployed, FemaleUnemployed),
+               names_to = "category", values_to = "Count") 
+
+# Labor Force Indicators by Gender Graph               
+ggplot(gender_long, aes(x = YearMonth, y = Count, color = category)) + 
+  geom_line() +
+  scale_color_manual(values = c("#1874cd", "#106e7c","#c71936", "#fa9770")) +
+  geom_vline(xintercept = as.numeric(as.yearmon("Mar 2020")), linetype = "dashed", color = "red") +
+  annotate("text", x = as.yearmon("Mar 2020"), y = 900, label = "March 2020", color = "darkgreen", angle = 90, vjust = -0.5, hjust = 0) +
+  labs(title = "Labor Force Indicators by Gender", y = "Count", color = "Category") + 
+  theme_light() 
+```
+
+The first two graphs depict the monthly trends of employment and unemployment ratios in the retail industry, respectively. The employment ratio graph shows a relatively stable trend before the pandemic, fluctuating around 0.94 - 0.96. However, in March 2020, there is a sharp decline in the employment ratio, dropping to approximately 0.82 by April 2020. This sudden decrease aligns with the onset of the COVID-19 pandemic and the implementation of lockdown measures, which significantly impacted the retail sector. Similarly, the unemployment ratio graph shows a consistently low ratio between 0.04 - 0.06 prior to the pandemic, followed by a spike reaching over 0.18 in April 2020.
+
+Following the initial shock, both graphs show a gradual recovery in employment. The employment ratio begins to trend upward, while the unemployment ratio starts to decline. This suggests that as businesses adapted to the new circumstances and lockdown measures were eased, the retail industry started to regain some of the lost jobs. However, it is important to note that the employment ratio does not immediately return to pre-pandemic levels, indicating that the impact of COVID-19 on retail employment persisted even as the situation improved.
+
+The third graph breaks down the labor force indicators by gender, providing more insights on how the pandemic affected employment and unemployment for males and females in the retail sector. Before the pandemic, the counts of employed males and females remained relatively stable, with males slightly exceeding females in retail workforce. This indicates that men make up a larger portion of the retail workforce. However, the graph reveals that the impact of the pandemic on employment was higher for females compared to males. The decline in female employment during the pandemic period is steeper and more sustained than the decline in male employment, suggesting that women in the retail industry were disproportionately affected by job losses. Additionally, the recovery in employment counts appears to be slower for females, indicating that women faced greater challenges in regaining employment during the recovery phase.
+
+### Regression Models
+
+In this regression analysis, we aim to investigate the impact of the COVID-19 pandemic on the weighted employment (wtemployed) in the retail industry while considering the effects of age group and gender. The analysis includes three models with different specifications.
+
+Controlling for YearMonth: We control for the YearMonth variable in all three models to account for the temporal effects on employment. By including YearMonth, we capture the overall trend in employment over time, which helps isolate the impact of the COVID-19 pandemic (PostCOVID) and other variables of interest.
+
+Interaction Terms: In models 2 and 3, we introduce interaction terms between PostCOVID and AgeGroup, as well as PostCOVID and Gender. These interaction terms allow us to examine whether the impact of the COVID-19 pandemic on employment varies across different age groups and genders. Since there is only one retail industry in the data, including interaction terms while controlling for YearMonth enables us to capture the differential effects of the pandemic on specific subgroups within the retail industry.
+
+Log Transformation: In model 3, we apply a log transformation to the dependent variable wtemployed. This transformation is useful when dealing with skewed data, as it helps to normalize the distribution and reduce the influence of extreme values. Using log(wtemployed) as the dependent variable enables us to interpret the coefficients as percentage changes in employment for a unit change in the independent variables.
+
+```{r}
+# Regression models
+model1 <- feols(wtemployed ~ PostCOVID + YearMonth, vcov = "hetero" ,data = regression)
+model2 <- feols(wtemployed ~ PostCOVID*AgeGroup + PostCOVID*Gender + YearMonth, vcov = "hetero", data = regression)
+model3 <- feols(log(wtemployed) ~ PostCOVID*AgeGroup + PostCOVID*Gender + YearMonth, vcov = "hetero", data = regression)
+summary(model1)
+summary(model2)
+summary(model3)
+etable(model1, model2, model3)
+```
+
+### Regression Models Interpretation
+
+Model 1: The baseline model estimates a 0.038 reduction in the weighted employment rate after the start of COVID, which is statistically significant at the 0.1% level. This model also controls for the overall time trend, with each additional month associated with a 0.005 increase in the weighted employment rate, statistically significant at the 5% level.
+
+Model 2: This model extends the baseline model by including interaction terms between the PostCOVID indicator and the AgeGroup and Gender variables, allowing the effect of COVID to vary by age group and gender. The model also controls for the overall time trend. The main effect of PostCOVID remains significant, indicating a 0.044 decrease in the weighted employment rate after the start of COVID, holding age group, gender, and time trend constant. The main effects of AgeGroup and Gender are also significant, with each additional age group associated with a 0.024 higher employment rate and being male associated with a 0.007 higher employment rate, relative to being female. However, the interaction terms are not statistically significant, suggesting that the effect of COVID on employment does not significantly differ by age group or gender. The overall time trend remains significant, with each additional month associated with a 0.005 increase in the weighted employment rate.
+
+Model 3: Given the skewed distribution of the weighted employment rate, this model uses a log-transformed dependent variable. The log-linear specification estimates that the post-COVID period saw an overall 4.9% decline in retail employment, statistically significant at the 0.1% level, holding age group, gender, and the time trend constant. Consistent with the other models, it also finds higher employment rates for each additional age group (by 2.5%, statistically significant at the 0.1% level) and for males (by 0.7%, statistically significant at the 1% level). The interaction terms remain insignificant, indicating that the pandemic's effect is relatively uniform across age groups and genders.
+
+### Limitations
+
+When interpreting the results of this analysis, it is important to consider potential biases and limitations. For instance, the pre-post comparison assumes that the pandemic was the only major factor differentially affecting retail employment around March 2020, but there could be other time-varying confounders not captured in the data. In addition, the models account for age and gender but do not capture other potentially relevant characteristics such as race, education, or geographic location. Consequently, the parametric assumptions of the models may not fully capture the complexity of the true relationships. Lastly, sample selection bias is a potential concern in this analysis, as the data may not be perfectly representative of the entire retail industry population. If the sample overrepresents certain retail sectors or geographic regions that were more severely affected by the pandemic, the estimated impact of COVID-19 on employment may be overstated.
+
+### Conclusion
+
+Across all models, the PostCOVID coefficient remains negative and statistically significant at the 0.1% level, indicating a substantial decline in retail employment after the start of the pandemic. The magnitude of the effect ranges from a 0.038 reduction in the weighted employment rate in model 1 to a 4.9% decrease in model 3. The time trend (YearMonth) is positive and significant at the 5% level in all models, suggesting a gradual increase in employment over time, holding other factors constant. Models 2 and 3 introduce age group and gender as control variables, revealing that older age groups (41 - 62) and males have significantly higher employment rates compared to their respective counterparts. However, the interaction terms between PostCOVID and AgeGroup/Gender are not statistically significant, indicating that the pandemic's impact on employment is relatively uniform across these demographic groups. The use of heteroskedasticity-robust standard errors in all models strengthens the reliability of these findings by accounting for potential non-constant variance in the errors.
+
+## Research Question 2: How has retail fared relative to other industries?
+
+### Analysis Approach
+
+Based on our interpretation of the research question, we believe a logit interaction model with a binary dependent variable would be able to effectively answer our question. Similar to the first question, we will be using employment within industries to help measure the vitality of the retail industry. In this model however, we will be creating a new variable called ‘employed’, which is true or false depending on a person’s employment status (EMPSTAT). Our dependent variables would consist of binary indicators: "Retail," representing whether a person is or was employed in the retail industry, and "COVID," indicating whether the data observation was recorded before or during the COVID-19 pandemic. By examining the interaction between "Retail" and "COVID," we can assess the impact of the COVID-19 pandemic on employment within the retail sector, as well as make comparisons to the other industries.
+
+### Data Preparation
+
+As mentioned above, we have three columns of data that are essential for the model: Employed, Retail, and COVID. They were not variables available from the raw data so we had to do a few mutations.
+
+-   Employed - We are able to identify an individual’s employment status using the “EMPSTAT” column from the raw data. However, this variable is categorical, with various codes representing different employment statuses such as "Has a job, not at work last week" or "Unemployed, new worker".  To simplify our column’s variables we categorized the different employment status codes so our column directly answers the question; Is the person currently working or not? We also chose to filter out any individuals who were not part of the labor force.  That way, for individuals who are marked as unemployed, we can assume they are actively seeking work.  
+
+-   Retail - By using the "IND" column from the raw data, we were able to identify individuals that work in the retail industry. Based on this information, we created the “retail” column that assigns a value of "true" or "false" depending on whether that individual worked in the retail industry. 
+
+-   COVID - We used the date column to create the “COVID” column that indicates whether an observation was taken during or after the COVID-19 pandemic.
+
+```{r}
+data <- read_ipums_micro(ddi)
+#prepare data
+data <- data %>% filter( YEAR >= 2018 ) %>% 
+  filter(!(EMPSTAT == 1 | EMPSTAT >= 30 )) %>%
+  mutate(employed = ifelse(EMPSTAT == 10 | EMPSTAT == 12, TRUE, FALSE))
+
+df <- inner_join(data, ind, by = c('IND' = 'ind'))
+
+df <- df %>% mutate(retail = ifelse(indname == 'Retail Trade', TRUE, FALSE)) %>%
+  mutate(date = as.Date(paste(YEAR, MONTH, "01", sep = "-"))) %>% 
+  mutate(COVID = ifelse(date >= as.Date("2020-03-01"), TRUE, FALSE))
+```
+
+### A Glimpse of the Data
+
+Before getting our model set up, we wanted get a general idea of how COVID-19 effected the labor force. To do this, we graphed the total percentage of the labor force each industry contributed overtime. Surprisingly, our graph shows the retail industry does not seem to be effected by COVID-19 as much as we expected. This is especially true when its compared to the entertainment & hospitality industry. Nonetheless, we will dig deeper on this subject with our model.
+
+```{r}
+graphdf <- df %>% group_by(indname, date) %>%  summarize(totalworkers = sum(employed == TRUE))
+
+bymonthlbr <- graphdf %>% group_by(date) %>% summarize(lbrforce = sum(totalworkers))
+
+graphdf <- merge(graphdf, bymonthlbr, by = "date")
+
+graphdf <- graphdf %>% mutate(labrforcepercent = round((totalworkers/lbrforce) * 100, 2))
+
+ggplot(graphdf, aes(x = date, y = labrforcepercent, color = indname)) +
+  geom_line(size = 1) +
+  ggtitle("Percentage of Labor Force by Industry") +
+  labs(x = "Date", y = "Labor Force Percentage", color = "Industry") +
+  geom_vline(xintercept = as.numeric(as.Date("2020-03-01")), color = "red", linetype = "dashed") +
+  geom_label(aes(x = as.Date("2020-03-01"), y = 17, label = "COVID-19 Lockdowns Begin"),
+             fill = "white", color = "red", size = 4, fontface = "bold", vjust = -0.5, hjust = -.1) + 
+  theme(panel.grid.major.x = element_blank(),
+        panel.grid.major.y = element_line(color = "gray", size = 0.5),
+        panel.grid.minor = element_blank())
+```
+
+### Model Controls
+
+For our model, we identified the following controls:
+
+-   Sex - An individual's sex may play a role in whether one is hired or not. Even though it is illegal to discriminate based on sex or gender.
+
+-   Age - Another factor that could lead to being discriminated against. (Also illegal)
+
+-   Race - Similar to sex and age, an individual could be discriminated against for their race. (Also illegal)
+
+-   Seasonality - Retail companies would often hire seasonal workers to have smoother operations during their peak seasons.
+
+```{r}
+#set up model, look at initial coefficients
+model <-feglm(employed ~ retail * COVID + i(MONTH) + AGE + SEX + RACE, family = binomial(link = 'logit'), data = df, se = 'hetero')
+
+etable(model, drop = 'MONTH')
+```
+
+### Additional Calculations for Binary Independent Variables & Interactions
+
+Logit interaction models are special in that the interaction coefficient of a model does not capture the magnitude of the effect we are actually looking for. In order to properly find the effect of the interaction, we will have to find the cross derivative. We achieve this by calculating the average marginal effect when COVID is False, and subtract it from the average marginal effect when COVID is True. For non-interaction terms, instead of the coefficient found by the model we use the average marginal effects.
+
+```{r}
+#find average marginal effects
+avg_slopes(model, variables = c('retail','COVID'))
+
+#calculate cross derivative
+slopes(model, datagrid(COVID = FALSE, grid.type = 'counterfactual'), variables = c('retail','COVID'))
+slopes(model, datagrid(COVID = TRUE, grid.type = 'counterfactual'),variables = c('retail','COVID'))
+
+interaction <- (-.0111 + (-.0089))
+interaction
+```
+
+### Results + Interpretation
+
+We are now able to interpret our model:
+
+-   The COVID-19 pandemic, during or after, is associated with a 0.02140 decrease in the probability of being employed
+
+-   Working in the retail industry is associated with a 0.00971 decrease in the probability of being e
+
+-   The effect of the COVID-19 pandemic is associated with a .0022 decrease in the probability that a person in the retail industry is employed.
+
+With consideration that COVID has negatively impacted the probability of employment across all industries substantially, the retail industry appears to have been relatively resilient. Although the retail industry already exhibited a negative effect on employment probability before COVID, the additional decrease of .0022 in probability seems minimal in comparison.
+
+This could be attributed to the wide range of business types that fall within the industry. For instance, grocery stores, which are classified as retail, remained essential during the pandemic due to the perpetual demand for their products. Additionally, non-essential retail businesses also found demand during the pandemic. For example, many individuals saw lock-down as an opportunity to make home improvements, and found themselves purchasing goods from home-improvement stores such as IKEA. The pandemic was also encouraged individuals to explore new hobbies, which could result in more spending.
+
+It's crucial to also consider that COVID may have simply redirected shopping habits from in-person to online channels. Nevertheless, retail businesses managed to generate profits, adapting to the changing landscape through various means.
+
+## Research Question 3: Retail needs to worry about who has money to spend - what has changed about who is working and earning money?
+
+Given the research question "Retail needs to worry about who has money to spend - what has changed about who is working and earning money?"This analysis aims to dissect the dynamics of employment and income in the context of potentially shifting consumer and purchase power bases for the retail industry, especially in light of the COVID-19 pandemic. To answer the questions thoroughly, the analysis is structured to examine both individual (people level) and sector-wide (industry level) perspectives. This approach will enable a detailed exploration of how employment status, income variations, and industry-specific trends collectively impact consumer spending and the income market landscape. 
+
+To understand how COVID-19 has affected people's earnings, a Different in Different model is employed to reveal whether individuals experienced a change in income before and after COVID. This model uses independent variables such as demographic variables (age, sex and race) along with employment status to measure the impact on income across different groups. The "Retail Trade" industry is designated as the treatment group, which allows for a direct assessment of how this sector has been impacted compared to others. We utilize the post-treatment variable to distinguish between the periods before and after COVID-19. This allows for comparisons between pre-COVID and pandemic era periods.
+
+Visualization
+
+```{r}
+df_final$EMPSTAT <- ifelse(df_final$EMPSTAT >= 20, "Unemployed", "Employed")
+unique(df_final$RACE)
+#Create a plot to compare the average income between Retail Trade and Other Industries
+df_final$group <- ifelse(df_final$indname == "Retail Trade", "Retail Trade", "Other Industries")
+
+
+avg_income_by_group_year <- df_final %>%
+  group_by(group, YEAR) %>%
+  summarise(mean_income = mean(INCTOT, na.rm = TRUE)) %>%
+  ungroup()
+
+# Avergae Income Plot
+ggplot(avg_income_by_group_year, aes(x = YEAR, y = mean_income, color = group)) +
+  geom_line() +
+  geom_vline(xintercept = 2020, linetype="dashed", color = "red")+
+  labs(title = "Difference-in-Differences: Average Income by Industry",
+       x = "Year",
+       y = "Average Income",
+       color = "Group") +
+  theme_minimal()
+
+
+# Calculate employment counts by group and year
+employment_counts_by_group_year <- df_final %>%
+  filter(EMPSTAT == "Employed") %>%
+  group_by(YEAR) %>%
+  summarise(count_employed = n(), .groups = 'drop') %>%
+  ungroup()
+
+# Plot
+ggplot(employment_counts_by_group_year, aes(x = YEAR, y = count_employed)) +
+  geom_line() +
+  geom_vline(xintercept = 2020, linetype="dashed", color = "red")+
+  geom_point() + # Adding points for clarity
+  labs(title = "Employment Numbers Over Time by Industry",
+       x = "Year",
+       y = "Count of Employed Individuals",
+       color = "Group") +
+  theme_minimal()
+```
+
+This graph  likely shows a downward trend in the number of employed individuals over time. Both Pre Covid and post Covid have affected the employment market negatively. Consequently, numerous individuals have lost their jobs or faced layoffs. This leads to a potential decrease in spending power. Although there is a noted increase in average income after the onset of COVID, this growth must be contextualized with the rising inflation rates, economic challenges, and shortages of food and goods, all of which pose significant obstacles to consumer spending capabilities.
+
+```{r}
+df_final <- df_final %>%
+  mutate(post_treatment = YEAR >= 2020) %>%
+  group_by(CPSIDV, YEAR) %>%
+  mutate(mean_income = mean(INCTOT, na.rm = TRUE)) %>% ungroup()
+
+df_final$SEX <- ifelse(df_final$SEX == 1, "Male", "Female")
+df_final$RACE <- ifelse(df_final$RACE == 100, "White",
+                                ifelse(df_final$RACE == 200, "Black",
+                                       ifelse(df_final$RACE == 651, "Asian", "Other")))
+
+
+
+#Diff in Diff Model
+
+df_final$treated_group <- ifelse(df_final$indname == "Retail Trade", 1, 0)
+
+# Run the DiD model with an interaction between treated_group and post_treatment
+dif_in_dif_model <- feols(INCTOT ~ treated_group * post_treatment + AGE + SEX + factor(RACE) + factor(EMPSTAT)| SERIAL, data = df_final)
+
+# View the summary of the model
+etable(dif_in_dif_model)
+```
+
+According to the table, there are statistically significant relationships between various factors and income changes, before and after the pandemic. Employees in the retail sector experienced an average income reduction of \$10,564 compared to the other industries, before the pandemic. This indicates that the retail employee has the pre-pandemic challenges faced. After the COVID, the income increased by \$9,280 for all industries, suggesting an overall positive effect of COVID impact on income. Furthermore, demographics act as a positive determinant of income. For each additional year of age, the income increases by \$1,271, holding all else constant. Male individuals earn significantly more, with an average income increase of \$21,379.8 compared to females. In terms of racial comparisons with the Asian demographic, Black individuals earn \$25,138.1 less, those classified as Other \$21,336.9 less, and White individuals \$11,865.3 less. Yet, being unemployed compared to the employed baseline category is associated with a \$31,255 decrease in income, highlighting the severe economic impact of job loss. On average, individuals in the retail sector experienced an additional income decrease of \$3,181 after COVID-19 compared to those in other sectors. 
+
+# **Changes to money holders by industry:**
+
+In the wake of the COVID-19 pandemic, there have been significant changes to the makeup of the US labor force. Looking at the rate of labor force participation across all industries shows statistically significant drops not just in retail but across industries.
+
+```{r}
+data <- read_ipums_micro(ddi)
+
+#factor years, 
+data <- data %>% mutate(data, yf = factor(data$YEAR))
+
+#precovid and post covid for diff in diff approaches
+data <- data %>% mutate(data, pndmc = case_when( YEAR < 2020 | (YEAR == 2020 & MONTH < 4) ~ 0,
+                                                 TRUE ~ 1))
+#factor sex
+data <- data %>% mutate(data, sx = case_when(SEX < 2  ~ 0,
+                                                 TRUE ~ 1))
+
+
+
+
+#Industry remapping to make workable, took 280 different indusrty codes and condensed into 16, also truncated names for nicer graphing
+data <- data %>% mutate(data, indclust = case_when( IND < 1 ~ "NIU",
+                                                    IND < 300 ~ "AG & Frstry",
+                                                    IND < 1000 ~ "Mining, Util, & Const",
+                                                    IND < 1400 ~ "Secondary Food",
+                                                    IND < 4000 ~ "Manufacturing",
+                                                    IND < 4600 ~ "Wholesale",
+                                                    IND < 4700 | (IND > 8769  &  IND < 8781) ~ "Auto",
+                                                    IND < 4900 ~ "Furn + Appliances",
+                                                    IND < 5000 ~ "Food Sellers",
+                                                    IND < 5085 | IND == 7480 | (IND > 7900 & IND < 8300) ~ "Healthcare",
+                                                    IND < 6000 ~ "Retail",
+                                                    IND < 6400 ~ "Transport",
+                                                    IND < 6800 | (IND > 8560 & IND < 8600) ~ "Info & entertainment",
+                                                    IND < 7075 | (IND > 8659 & IND < 8671) ~ "Finance",
+                                                    (IND > 7800 & IND < 7900) ~ "Education",
+                                                    TRUE ~ "Other"
+                                                    
+                                                    ))
+
+
+
+
+
+#bianary of unable to work due to covid
+data <- data %>% mutate(data, cvunemp = case_when(COVIDUNAW == 1 ~ 0, 
+                                                  COVIDUNAW == 2 ~ 1
+                                                ) )
+
+
+#factor and filter in labor force data
+labdata <- data %>% filter(data$LABFORCE > 0)
+
+
+labdata <- labdata %>% mutate(labdata, labf2 = case_when(LABFORCE == 1 ~ 0,
+                                                         TRUE ~ 1))
+
+
+
+
+
+
+incdata <- data %>% filter(!is.na(INCTOT))
+
+
+```
+
+One assumption made in this analysis is that the industry a person works in is on average likely to be the field they continue to work in. As such the aggregate changes shown at the industry level can give practical insights to retailers about the changing income distributions of Americans. Another assumption is that industry income data is useful to retailers as industries likely have a high correlation with the kind of highly tailored advertising used across online retail. When controlling for gender there were statically significant drops in laborforce participation in transportation, wholesalers, entertainment, and furniture/appliance sellers. Each of these industries saw a drop of about 0.3% compared to pre pandemic participation levels.
+
+```{r}
+
+
+labforcepr_feols <- feols(labf2 ~ pndmc + indclust + (indclust*pndmc), data = labdata)
+
+labforceprsx_feols <- feols(labf2 ~ pndmc + indclust + (indclust*pndmc) + sx, data = labdata)
+
+
+etable(labforcepr_feols, labforceprsx_feols,  vcov = 'hetero')
+
+```
+
+This industry variation also shows up strongly in the decreases in both mean and median household income but with some differences from the changes shown in labor force participation. While all industries saw decreases in both mean and median household income after the pandemic, agriculture, finance, entertainment, and surprisingly healthcare have been among the industries hardest hit. 
+
+```{r}
+#Industry mean HHIncome
+
+mean_hhincome <- incdata %>% group_by(indclust) %>%  summarize(mean_HHIncome = mean(HHINCOME, na.rm = TRUE))
+
+precinc <- incdata %>% filter(incdata$pndmc < 1)
+
+mean_hhincomeprec <- precinc %>% group_by(indclust) %>%  summarize(mean_HHIncome = mean(HHINCOME, na.rm = TRUE))
+
+postcinc <- incdata %>% filter(incdata$pndmc == 1)
+
+mean_hhincomepostc <- postcinc %>% group_by(indclust) %>%  summarize(mean_HHIncome = mean(HHINCOME, na.rm = TRUE))
+
+
+barplot(mean_hhincomeprec$mean_HHIncome - mean_hhincomepostc$mean_HHIncome, col= 1:4, main = "Mean Household Income Change By Industry (Pre Covid to Post Covid)", ylab = "USD")
+legend('topright', legend= mean_hhincome$indclust,
+       col=1:4, pch=1, cex=0.35)
+
+
+median_hhincomeprec <- precinc %>% group_by(indclust) %>%  summarize(median_HHIncome = median(HHINCOME, na.rm = TRUE))
+
+median_hhincomepostc <- postcinc %>% group_by(indclust) %>%  summarize(median_HHIncome = median(HHINCOME, na.rm = TRUE))
+
+barplot(median_hhincomeprec$median_HHIncome - median_hhincomepostc$median_HHIncome, col= 1:4, main = "Median Household Income Change By Industry (Pre Covid to Post Covid)", ylab = "USD")
+legend('topright', legend= mean_hhincome$indclust,
+       col=1:4, pch=1, cex=0.35)
+```
+
+Among respondents to the census covid survey, there were significantly different levels of persons reporting being unable to work due to covid. Retail had a relatively high rate of around 7% of respondents reporting being unable to work because of Covid. The info and entertainment industry again stands out as the hardest hit with 11.92% of respondents reporting being unable to work. However, the regression alone does not tell us about the present employment of these respondents and whether they have been able to return to work. Additionally, combining this data with the other industry-based regression paints a picture of the covid pandemic having a depreciating effect on labor force participation with variation across industries. The impacts of the pandemic have been felt across all industries and demographics but the impacts have not been equal for all.
+
+```{r}
+lniu  <- labdata %>% filter(indclust != 'NIU')
+
+pie(table(lniu$indclust), main = "Respondents by industry (all years)")
+
+ldf <- lniu %>% filter(pndmc < 1)
+
+
+
+fcvid <- feols(cvunemp ~ indclust,  data = labdata)
+
+fcvid2 <- feols(cvunemp ~ indclust + LABFORCE,  data = labdata)
+
+fcvid3 <- feols(cvunemp ~ indclust + factor(LABFORCE) + (indclust*factor(LABFORCE)),  data = labdata)
+etable(fcvid, fcvid2)
+
+pie(table(ldf$indclust),  main =  "Respondents by industry (Pre-Covid)")
+
+lpdf <- lniu %>% filter(pndmc > 0)
+
+pie(table(lpdf$indclust),  main = "Respondents by industry (Post-Covid)")
+
+
+
+
+```
+
+## 
